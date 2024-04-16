@@ -2,9 +2,6 @@
 #![no_main]
 
 use bleps::{
-    ad_structure::{
-        create_advertising_data, AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE,
-    },
     attribute_server::{AttributeServer, NotificationData, WorkResult},
     gatt, Ble, HciConnector,
 };
@@ -13,19 +10,26 @@ use esp_println::println;
 use esp_wifi::{ble::controller::BleConnector, initialize, EspWifiInitFor};
 
 use esp_hal as hal;
-pub type BootButton = crate::hal::gpio::Gpio0<crate::hal::gpio::Input<crate::hal::gpio::PullDown>>;
-use hal::{clock::ClockControl, peripherals::*, prelude::*, Rng, IO};
+use hal::{
+    adc::{AdcConfig, Attenuation, ADC},
+    clock::ClockControl,
+    peripherals::*,
+    prelude::*,
+    Delay, Rng, IO,
+};
 
+mod bluetooth;
+use bluetooth::bluetooth::print_ble_init;
+
+pub type BootButton = crate::hal::gpio::Gpio0<crate::hal::gpio::Input<crate::hal::gpio::PullDown>>;
 #[entry]
 fn main() -> ! {
     #[cfg(feature = "log")]
     esp_println::logger::init_logger(log::LevelFilter::Info);
 
     let peripherals = Peripherals::take();
-
     let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
-
     let timer = hal::timer::TimerGroup::new(peripherals.TIMG1, &clocks).timer0;
     let init = initialize(
         EspWifiInitFor::Ble,
@@ -40,30 +44,21 @@ fn main() -> ! {
     let button = io.pins.gpio0.into_pull_down_input();
 
     let mut debounce_cnt = 500;
-
     let mut bluetooth = peripherals.BT;
+
+    let mut adc1_config = AdcConfig::new();
+    let mut pin =
+        adc1_config.enable_pin(io.pins.gpio36.into_analog(), Attenuation::Attenuation11dB);
+    let mut adc1 = ADC::<ADC1>::new(peripherals.ADC1, adc1_config);
+
+    let mut delay = Delay::new(&clocks);
 
     loop {
         let connector = BleConnector::new(&init, &mut bluetooth);
         let hci = HciConnector::new(connector, esp_wifi::current_millis);
         let mut ble = Ble::new(&hci);
 
-        println!("{:?}", ble.init());
-        println!("{:?}", ble.cmd_set_le_advertising_parameters());
-        println!(
-            "{:?}",
-            ble.cmd_set_le_advertising_data(
-                create_advertising_data(&[
-                    AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-                    AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
-                    AdStructure::CompleteLocalName("Esp32"),
-                ])
-                .unwrap()
-            )
-        );
-        println!("{:?}", ble.cmd_set_le_advertise_enable(true));
-
-        println!("started advertising");
+        print_ble_init(&mut ble);
 
         let mut rf = |_offset: usize, data: &mut [u8]| {
             data[..20].copy_from_slice(&b"Hello Bare-Metal BLE"[..]);
@@ -111,6 +106,22 @@ fn main() -> ! {
         let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut rng);
 
         loop {
+            let adc1_data;
+            loop {
+                match adc1.read(&mut pin) {
+                    Ok(data) => {
+                        adc1_data = data;
+                        break;
+                    }
+                    Err(e) => {
+                        println!("Failed to read from ADC: {:?}", e);
+                        continue;
+                    }
+                };
+            }
+            println!("ADC1 data: {}", adc1_data);
+            delay.delay_ms(500u32);
+
             let mut notification = None;
 
             if button.is_low().unwrap() && debounce_cnt > 0 {
